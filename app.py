@@ -117,16 +117,14 @@ def compute(country1: str, country2: str, start: str, end: str) -> tuple[pd.Data
     e2 = fetch_series(country2, "XDC_USD.PA_RT")
     # E_i = units of local currency i per USD. Therefore S (currency 2 / currency 1) = E2 / E1.
     df = pd.concat({"P1": p1, "P2": p2, "E1_per_USD": e1, "E2_per_USD": e2}, axis=1)
-   start_period = pd.Period(start, freq="M")
-end_period = pd.Period(end, freq="M")
-
-df.index = pd.PeriodIndex(df.index, freq="M")
-df = df.sort_index()
-
-df = df.loc[
-    (df.index >= start_period) &
-    (df.index <= end_period)
-].copy()
+    start_period = pd.Period(start, freq="M")
+    end_period = pd.Period(end, freq="M")
+    df.index = pd.PeriodIndex(df.index, freq="M")
+    df = df.sort_index()
+    df = df.loc[
+        (df.index >= start_period) &
+        (df.index <= end_period)
+    ].copy()
     df["Nominal_S"] = df["E2_per_USD"] / df["E1_per_USD"]
     df["RER"] = df["Nominal_S"] * df["P1"] / df["P2"]
     df = df.replace([float("inf"), float("-inf")], float("nan"))
