@@ -190,3 +190,4 @@ st.download_button("Download selected sample as CSV", df.to_csv().encode("utf-8"
 with st.expander("View monthly observations and calculation details"):
     st.dataframe(df, use_container_width=True)
     st.markdown("**Formulas:** `S = E2_per_USD / E1_per_USD`; `RER = S × P1 / P2`; `RER* = mean(valid monthly RER in selected period)`; `Real Index = 100 × RER / RER*`. Missing observations are retained as blanks in the CSV and excluded from the mean.")
+
