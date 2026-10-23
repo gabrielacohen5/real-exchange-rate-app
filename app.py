@@ -38,6 +38,7 @@ def _csv_series(payload: bytes, country: str) -> pd.Series:
         raise ValueError(f"Unexpected IMF CSV columns: {', '.join(df.columns[:15])}")
     if "REF_AREA" in df.columns:
         df = df[df["REF_AREA"].astype(str).str.upper() == country]
+    # Preserve IMF monthly labels such as 2024-01; ignore invalid periods.
     dates = pd.to_datetime(df[date_col].astype(str), errors="coerce")
     values = pd.to_numeric(df[value_col], errors="coerce")
     result = pd.Series(values.to_numpy(), index=dates.dt.to_period("M"), dtype="float64")
@@ -65,6 +66,10 @@ def fetch_series(country: str, indicator: str) -> pd.Series:
             response.raise_for_status()
             if not response.content.strip():
                 errors.append(f"{flow}: empty response")
+                continue
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "html" in content_type or response.content.lstrip().startswith(b"<"):
+                errors.append(f"{flow}: unexpected non-CSV response")
                 continue
             series = _csv_series(response.content, country)
             if not series.empty:
@@ -117,14 +122,12 @@ def compute(country1: str, country2: str, start: str, end: str) -> tuple[pd.Data
     e2 = fetch_series(country2, "XDC_USD.PA_RT")
     # E_i = units of local currency i per USD. Therefore S (currency 2 / currency 1) = E2 / E1.
     df = pd.concat({"P1": p1, "P2": p2, "E1_per_USD": e1, "E2_per_USD": e2}, axis=1)
-    start_period = pd.Period(start, freq="M")
-    end_period = pd.Period(end, freq="M")
+    # Boolean selection works even when the requested boundary months are absent.
     df.index = pd.PeriodIndex(df.index, freq="M")
     df = df.sort_index()
-    df = df.loc[
-        (df.index >= start_period) &
-        (df.index <= end_period)
-    ].copy()
+    start_period = pd.Period(start, freq="M")
+    end_period = pd.Period(end, freq="M")
+    df = df.loc[(df.index >= start_period) & (df.index <= end_period)].copy()
     df["Nominal_S"] = df["E2_per_USD"] / df["E1_per_USD"]
     df["RER"] = df["Nominal_S"] * df["P1"] / df["P2"]
     df = df.replace([float("inf"), float("-inf")], float("nan"))
@@ -172,7 +175,7 @@ if start_month > end_month:
 try:
     with st.spinner("Retrieving monthly CPI and exchange rates from IMF…"):
         df, benchmark = compute(countries[c1], countries[c2], start_month, end_month)
-except ValueError as exc:
+except (ValueError, requests.RequestException, pd.errors.ParserError) as exc:
     st.error(str(exc))
     st.info("The IMF API may use different dataflow versions or may not publish the selected series. Check the IMF Data Portal and try another country or date range.")
     st.stop()
@@ -197,4 +200,3 @@ st.download_button("Download selected sample as CSV", df.to_csv().encode("utf-8"
 with st.expander("View monthly observations and calculation details"):
     st.dataframe(df, use_container_width=True)
     st.markdown("**Formulas:** `S = E2_per_USD / E1_per_USD`; `RER = S × P1 / P2`; `RER* = mean(valid monthly RER in selected period)`; `Real Index = 100 × RER / RER*`. Missing observations are retained as blanks in the CSV and excluded from the mean.")
-
