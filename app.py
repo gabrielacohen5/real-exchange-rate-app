@@ -47,25 +47,36 @@ def _csv_series(payload: bytes, country: str) -> pd.Series:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_series(country: str, indicator: str) -> pd.Series:
-    # IMF SDMX 3.0 data endpoint: database IMF.STA,DF_CPI / DF_ER are
-    # tried in addition to compact-key endpoints to handle API variations.
+    """Query current IMF SDMX dataflows, reporting failures transparently."""
     key = f"{country}.{indicator}.M"
-    candidates = [
-        f"{BASE}/data/dataflow/IMF.STA/DF_CPI/1.0.0/+/{key}" if indicator.startswith("CPI") else f"{BASE}/data/dataflow/IMF.STA/DF_ER/1.0.0/+/{key}",
-        f"{BASE}/data/IMF.STA,DF_CPI,1.0/{key}" if indicator.startswith("CPI") else f"{BASE}/data/IMF.STA,DF_ER,1.0/{key}",
-    ]
+    # CPI and exchange-rate series may reside in different IMF dataflows.
+    # The SDMX 3.0 route requires /data/dataflow/{agency}/{flow}/+/{key}.
+    flows = ("CPI", "IFS") if indicator.startswith("CPI") else ("ER", "IFS")
     errors = []
-    for url in candidates:
+    for flow in flows:
+        url = f"{BASE}/data/dataflow/IMF.STA/{flow}/+/{key}"
         try:
-            response = session.get(url, params={"startPeriod": START}, timeout=TIMEOUT)
+            response = session.get(
+                url,
+                params={"startPeriod": START},
+                headers={"Accept": "application/vnd.sdmx.data+csv;version=2.0"},
+                timeout=TIMEOUT,
+            )
             response.raise_for_status()
+            if not response.content.strip():
+                errors.append(f"{flow}: empty response")
+                continue
             series = _csv_series(response.content, country)
             if not series.empty:
                 return series
-            errors.append("No observations returned")
+            errors.append(f"{flow}: no matching monthly observations")
         except (requests.RequestException, ValueError, pd.errors.ParserError) as exc:
-            errors.append(str(exc)[:160])
-    raise ValueError(f"IMF data unavailable for {country} / {indicator}. " + " | ".join(errors))
+            errors.append(f"{flow}: {str(exc)[:140]}")
+    raise ValueError(
+        f"IMF data unavailable for {country} / {indicator}. "
+        + " | ".join(errors)
+        + ". Confirm current dataflow IDs and series dimensions in the IMF Data Portal."
+    )
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
