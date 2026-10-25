@@ -1,8 +1,6 @@
 """Real Exchange Rate Explorer — IMF SDMX 3.0 monthly data."""
 from __future__ import annotations
 
-import io
-import re
 from datetime import date
 
 import pandas as pd
@@ -30,86 +28,94 @@ def month_bounds(start: pd.Period, end: pd.Period) -> tuple[str, str]:
 
 
 def extract_series(payload: object, indicator: str) -> pd.Series:
-    """Parse SDMX-JSON 2.0 observations, using dimension positions, not assumed ordering."""
-    if not isinstance(payload, dict) or "data" not in payload or "structures" not in payload:
-        raise ValueError("Unexpected IMF response format (expected SDMX-JSON 2.0).")
-    structures = payload["structures"]
-    datasets = payload["data"]
-    if not structures or not datasets:
-        return pd.Series(dtype="float64")
-    structure = structures[0]
-    dims = structure.get("dimensions", {}).get("observation", [])
-    time_dim = next((i for i, d in enumerate(dims) if d.get("id", "").upper() in ("TIME_PERIOD", "TIME")), None)
-    if time_dim is None:
-        raise ValueError("IMF response has no observation time dimension.")
-    time_values = dims[time_dim].get("values", [])
+    """Read SDMX-JSON 2.0 or 1.0, including series-level observations."""
+    if not isinstance(payload, dict):
+        raise ValueError("IMF returned a non-object JSON response.")
+
+    # SDMX-JSON 2.0: data + structures; SDMX-JSON 1.0: dataSets + structure.
+    if "data" in payload and "structures" in payload:
+        datasets = payload.get("data") or []
+        structures = payload.get("structures") or []
+        if not structures:
+            return pd.Series(dtype=float, name=indicator)
+        structure = structures[0]
+    elif "dataSets" in payload and "structure" in payload:
+        datasets = payload.get("dataSets") or []
+        structure = payload["structure"]
+    else:
+        raise ValueError("Unexpected IMF JSON layout; expected SDMX-JSON 1.0 or 2.0.")
+
+    dimensions = structure.get("dimensions", {})
+    obs_dims = dimensions.get("observation", [])
+    series_dims = dimensions.get("series", [])
+    time_pos = next((i for i, dim in enumerate(obs_dims)
+                     if dim.get("id", "").upper() in {"TIME_PERIOD", "TIME"}), None)
+    if time_pos is None:
+        raise ValueError("IMF response does not identify a TIME_PERIOD dimension.")
+    time_values = obs_dims[time_pos].get("values", [])
     rows = []
-    for dataset in datasets:
-        for key, observation in dataset.get("observations", {}).items():
-            indexes = [int(v) for v in key.split(":")]
-            if len(indexes) <= time_dim or indexes[time_dim] >= len(time_values):
-                continue
-            raw_date = time_values[indexes[time_dim]].get("id")
-            raw_value = observation[0] if isinstance(observation, list) and observation else None
+
+    def add_observations(observations: dict) -> None:
+        for key, observation in observations.items():
             try:
-                period = pd.Period(str(raw_date), freq="M")
-                value = float(raw_value)
-                if pd.notna(value) and value > 0:
-                    rows.append((period, value))
-            except (ValueError, TypeError):
+                parts = [int(part) for part in str(key).split(":")]
+                if len(parts) <= time_pos:
+                    continue
+                month = pd.Period(str(time_values[parts[time_pos]]["id"])[:7], freq="M")
+                raw = observation[0] if isinstance(observation, (list, tuple)) and observation else observation
+                value = float(raw)
+                if pd.notna(value) and 0 < value < float("inf"):
+                    rows.append((month, value))
+            except (ValueError, TypeError, IndexError, KeyError, OverflowError):
                 continue
+
+    for dataset in datasets:
+        add_observations(dataset.get("observations", {}))
+        for series in dataset.get("series", {}).values():
+            add_observations(series.get("observations", {}))
+
     if not rows:
-        return pd.Series(dtype="float64", name=indicator)
+        return pd.Series(dtype=float, name=indicator)
     frame = pd.DataFrame(rows, columns=["month", "value"])
-    # Duplicate months may occur if an IMF response contains multiple series.
-    # Never silently average different observations.
-    if frame["month"].duplicated().any():
-        if frame.groupby("month")["value"].nunique().gt(1).any():
-            raise ValueError(f"Multiple conflicting IMF values for {indicator}.")
-        frame = frame.drop_duplicates("month")
-    return frame.set_index("month")["value"].sort_index().rename(indicator)
+    if frame.groupby("month")["value"].nunique().gt(1).any():
+        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
+    return (frame.drop_duplicates("month").set_index("month")["value"]
+            .sort_index().rename(indicator))
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
-def fetch_indicator(indicator: str, start: str, end: str) -> pd.Series:
-    """Fetch one IMF Data Portal indicator from the SDMX 3.0 data endpoint.
+def fetch_indicator(code: str, kind: str, start: str, end: str) -> pd.Series:
+    """Fetch CPI or FX from the exact IMF.STA SDMX 3.0 dataflow templates."""
+    if kind == "CPI":
+        flow, key = "CPI", f"{code}.CPI._T.IX.M"
+    elif kind == "FX":
+        flow, key = "ER", f"{code}.XDC_USD.PA_RT.M"
+    else:
+        raise ValueError(f"Unsupported series type: {kind}")
 
-    IMF's SDMX 3.0 API requires a dataflow identifier and its series key.
-    The requested indicator names are IMF legacy indicator identifiers; their
-    availability in a specific SDMX dataflow is not guaranteed.
-    """
-    # IMF's IFS dataflow (legacy IFS indicator identifiers).
-    # The endpoint and dataflow can change with IMF data migrations.
-    url = f"{BASE}/data/IMF.STA,IFS,1.0/{indicator}"
-    params = {"startPeriod": start, "endPeriod": end, "format": "csvfile"}
-    headers = {"Accept": "text/csv, application/vnd.sdmx.csv;version=2"}
+    # The IMF examples encode the time constraint as:
+    # c[TIME_PERIOD]=ge:YYYY-MM+le:YYYY-MM
+    url = f"{BASE}/data/dataflow/IMF.STA/{flow}/+/{key}"
+    params = {"c[TIME_PERIOD]": f"ge:{start}+le:{end}"}
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+        response = requests.get(
+            url, params=params,
+            headers={"Accept": "application/vnd.sdmx.data+json;version=2, application/json"},
+            timeout=TIMEOUT,
+        )
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise RuntimeError(f"IMF API request failed for {indicator}: {exc}") from exc
+        raise RuntimeError(f"IMF {flow} request failed for {code}: {exc}") from exc
     try:
-        frame = pd.read_csv(io.StringIO(response.text), low_memory=False)
-    except Exception as exc:
-        raise ValueError(f"IMF returned unreadable CSV for {indicator}.") from exc
-    time_col = next((c for c in frame.columns if c.upper() in ("TIME_PERIOD", "TIME")), None)
-    value_col = next((c for c in frame.columns if c.upper() in ("OBS_VALUE", "VALUE")), None)
-    if not time_col or not value_col:
-        raise ValueError(f"Unexpected IMF CSV columns for {indicator}: {list(frame.columns)[:12]}")
-    if "INDICATOR" in frame.columns:
-        frame = frame.loc[frame["INDICATOR"].astype(str) == indicator]
-    frame = frame[[time_col, value_col]].copy()
-    frame["month"] = pd.to_datetime(frame[time_col], errors="coerce").dt.to_period("M")
-    frame["value"] = pd.to_numeric(frame[value_col], errors="coerce")
-    frame = frame.dropna(subset=["month", "value"])
-    frame = frame.loc[frame["value"] > 0]
-    if frame["month"].duplicated().any():
-        if frame.groupby("month")["value"].nunique().gt(1).any():
-            raise ValueError(f"Conflicting values for {indicator} in IMF response")
-        frame = frame.drop_duplicates("month")
-    if frame.empty:
-        return pd.Series(dtype=float, name=indicator)
-    return frame.set_index("month")["value"].sort_index().rename(indicator)
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError(f"IMF returned non-JSON data for {code} {flow}.") from exc
+    return extract_series(payload, f"{code} {kind}")
+
+
+def usd_fx(start: pd.Period, end: pd.Period) -> pd.Series:
+    """USD per USD is exactly one; no IMF exchange-rate call required."""
+    return pd.Series(1.0, index=pd.period_range(start, end, freq="M"), name="USA FX")
 
 
 def calculate(cpi1: pd.Series, cpi2: pd.Series, fx1: pd.Series, fx2: pd.Series,
@@ -195,14 +201,14 @@ def main() -> None:
     names = (c1.rsplit(" (", 1)[0], c2.rsplit(" (", 1)[0])
     try:
         with st.spinner("Retrieving IMF observations…"):
-            cpi1 = fetch_indicator(f"I{code1}_CPI_TIX_M", str(start), str(end))
-            cpi2 = fetch_indicator(f"I{code2}_CPI_TIX_M", str(start), str(end))
-            fx1 = fetch_indicator(f"I{code1}_XDC_USD_PA_RT_M", str(start), str(end))
-            fx2 = fetch_indicator(f"I{code2}_XDC_USD_PA_RT_M", str(start), str(end))
+            cpi1 = fetch_indicator(code1, "CPI", str(start), str(end))
+            cpi2 = fetch_indicator(code2, "CPI", str(start), str(end))
+            fx1 = usd_fx(start, end) if code1 == "USA" else fetch_indicator(code1, "FX", str(start), str(end))
+            fx2 = usd_fx(start, end) if code2 == "USA" else fetch_indicator(code2, "FX", str(start), str(end))
             df, benchmark = calculate(cpi1, cpi2, fx1, fx2, start, end, *names)
     except (RuntimeError, ValueError, requests.RequestException) as exc:
         st.error(str(exc))
-        st.info("The IMF may not publish these legacy indicator keys in the selected SDMX dataflow. Check IMF Data Portal availability and the API dataflow/version.")
+        st.info("Check the country code, requested months, and IMF data availability. Some countries have limited CPI or FX coverage.")
         return
     valid = int(df["RER"].notna().sum())
     if valid == 0:
@@ -224,8 +230,8 @@ def main() -> None:
     with st.expander("Calculation methodology"):
         st.latex(r"S_t = E_{2,t}/E_{1,t}")
         st.latex(r"RER_t = S_t (P_{1,t}/P_{2,t})")
-        st.latex(r"RER^* = \\frac{1}{N}\\sum_{t\\in\\text{valid months}} RER_t")
-        st.latex(r"RealIndex_t = 100\\frac{RER_t}{RER^*}")
+        st.latex(r"RER^* = \frac{1}{N}\sum_{t\in\text{valid months}} RER_t")
+        st.latex(r"RealIndex_t = 100\frac{RER_t}{RER^*}")
         st.write("E is local currency units per USD. The nominal series is not normalized. CPI base-year conventions can affect RER levels, but not the normalized index if consistent within each series.")
 
 
