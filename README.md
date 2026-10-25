@@ -27,14 +27,16 @@ Open the local URL displayed by Streamlit (usually http://localhost:8501).
 3. Select Real, Nominal, or Both and click **Analyze exchange rates**.
 4. Inspect the interactive plot and monthly table; download the CSV.
 
-## Data source and compatibility
+## IMF data source (updated)
 
-The application calls the IMF SDMX 3.0 endpoint at `https://api.imf.org/external/sdmx/3.0`, using the IMF IFS dataflow and the requested legacy indicator names:
+The app uses the IMF SDMX 3.0 public API (no key needed) and requests SDMX-JSON:
 
-- `I{ISO3}_CPI_TIX_M`
-- `I{ISO3}_XDC_USD_PA_RT_M`
+- CPI: `https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/CPI/+/{ISO3}.CPI._T.IX.M?c%5BTIME_PERIOD%5D=ge%3A{START}%2Ble%3A{END}`
+- Exchange rate: `https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/ER/+/{ISO3}.XDC_USD.PA_RT.M?c%5BTIME_PERIOD%5D=ge%3A{START}%2Ble%3A{END}`
 
-The Euro area code is `G163`. The API can change dataflow identifiers, versions, key dimensions, or availability. These legacy identifiers **may not resolve** in the current SDMX 3.0 IFS flow. The application shows a descriptive error rather than inventing observations. Check the IMF's current dataflow and series catalog before relying on it in production. This version has not been end-to-end validated against a live IMF response.
+`{ISO3}` is the country code, `{START}` and `{END}` are `YYYY-MM`. Euro area uses `G163`. The app retrieves two CPI series and up to two exchange-rate series. For the USA, FX is set to exactly 1 USD/USD without requesting an exchange-rate series. The parser supports SDMX-JSON 2.0 and the older SDMX-JSON 1.0 layout. All observations are from IMF; missing observations are never fabricated.
+
+**Validation:** Python compilation and mocked SDMX response tests can verify code paths without IMF network access. Live IMF API availability was not independently verified in this environment. Country/month coverage is not guaranteed.
 
 ## Economic definitions
 
@@ -49,11 +51,11 @@ Missing, zero, negative, or nonnumeric observations are excluded from calculatio
 
 ## Troubleshooting
 
-- **HTTP 404 / 400 / empty results**: The IMF may have migrated or renamed the dataflow or indicator; confirm the latest SDMX catalog and update `fetch_indicator` accordingly.
+- **HTTP 404 / 400 / empty results**: Check the selected country, dataflow availability, and time range; the IMF may not publish all observations.
 - **HTTP 429 / timeout**: Wait and retry; cached successful responses are reused for 12 hours.
 - **Missing months**: Try more recent dates or different countries.
 - **Country not supported**: ISO 3166 country inclusion does not imply IMF series availability.
 
 ## Important limitation
 
-IMF API connectivity and current series-key compatibility could not be live-tested in this environment. Therefore this is a runnable application scaffold with full calculations and UI, **not a verified production-ready IMF integration**.
+The endpoint templates match the supplied tested public URLs, but a live end-to-end IMF response was not accessible for verification here. If the IMF changes its SDMX response schema or country coverage, an update may be required.
