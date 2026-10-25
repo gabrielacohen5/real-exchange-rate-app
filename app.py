@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from io import StringIO
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,42 +28,45 @@ def month_bounds(start: pd.Period, end: pd.Period) -> tuple[str, str]:
     return str(start), str(end)
 
 
+def _make_series(rows: list[tuple[pd.Period, float]], indicator: str) -> pd.Series:
+    if not rows:
+        return pd.Series(dtype=float, name=indicator)
+    frame = pd.DataFrame(rows, columns=["month", "value"])
+    if frame.groupby("month")["value"].nunique().gt(1).any():
+        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
+    return frame.drop_duplicates("month").set_index("month")["value"].sort_index().rename(indicator)
+
+
 def extract_series(payload: object, indicator: str) -> pd.Series:
-    """Read SDMX-JSON 2.0 or 1.0, including series-level observations."""
+    """Parse the SDMX-JSON 1.0/2.0 layouts, including series-level observations."""
     if not isinstance(payload, dict):
         raise ValueError("IMF returned a non-object JSON response.")
-
-    # SDMX-JSON 2.0: data + structures; SDMX-JSON 1.0: dataSets + structure.
     if "data" in payload and "structures" in payload:
         datasets = payload.get("data") or []
         structures = payload.get("structures") or []
-        if not structures:
-            return pd.Series(dtype=float, name=indicator)
-        structure = structures[0]
+        structure = structures[0] if structures else {}
     elif "dataSets" in payload and "structure" in payload:
         datasets = payload.get("dataSets") or []
         structure = payload["structure"]
     else:
-        raise ValueError("Unexpected IMF JSON layout; expected SDMX-JSON 1.0 or 2.0.")
-
+        raise ValueError(f"Unrecognized IMF JSON keys: {list(payload)[:12]}")
+    if isinstance(datasets, dict):
+        datasets = [datasets]
     dimensions = structure.get("dimensions", {})
     obs_dims = dimensions.get("observation", [])
-    series_dims = dimensions.get("series", [])
-    time_pos = next((i for i, dim in enumerate(obs_dims)
-                     if dim.get("id", "").upper() in {"TIME_PERIOD", "TIME"}), None)
+    time_pos = next((i for i, d in enumerate(obs_dims)
+                     if d.get("id", "").upper() in {"TIME_PERIOD", "TIME"}), None)
     if time_pos is None:
-        raise ValueError("IMF response does not identify a TIME_PERIOD dimension.")
+        raise ValueError("IMF JSON response has no TIME_PERIOD observation dimension.")
     time_values = obs_dims[time_pos].get("values", [])
     rows = []
 
-    def add_observations(observations: dict) -> None:
+    def add(observations):
         for key, observation in observations.items():
             try:
-                parts = [int(part) for part in str(key).split(":")]
-                if len(parts) <= time_pos:
-                    continue
-                month = pd.Period(str(time_values[parts[time_pos]]["id"])[:7], freq="M")
-                raw = observation[0] if isinstance(observation, (list, tuple)) and observation else observation
+                idx = int(str(key).split(":")[time_pos])
+                month = pd.Period(str(time_values[idx]["id"])[:7], freq="M")
+                raw = observation[0] if isinstance(observation, (list, tuple)) else observation
                 value = float(raw)
                 if pd.notna(value) and 0 < value < float("inf"):
                     rows.append((month, value))
@@ -70,47 +74,63 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
                 continue
 
     for dataset in datasets:
-        add_observations(dataset.get("observations", {}))
+        add(dataset.get("observations", {}))
         for series in dataset.get("series", {}).values():
-            add_observations(series.get("observations", {}))
+            add(series.get("observations", {}))
+    return _make_series(rows, indicator)
 
-    if not rows:
-        return pd.Series(dtype=float, name=indicator)
-    frame = pd.DataFrame(rows, columns=["month", "value"])
-    if frame.groupby("month")["value"].nunique().gt(1).any():
-        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
-    return (frame.drop_duplicates("month").set_index("month")["value"]
-            .sort_index().rename(indicator))
+
+def extract_csv(content: str, indicator: str) -> pd.Series:
+    """Parse IMF SDMX-CSV, whose rows contain TIME_PERIOD and OBS_VALUE."""
+    try:
+        frame = pd.read_csv(StringIO(content), dtype=str, sep=None, engine="python", on_bad_lines="error")
+    except (ValueError, pd.errors.ParserError) as exc:
+        raise ValueError(f"Could not parse IMF CSV: {exc}") from exc
+    frame.columns = [str(col).strip().lstrip("\ufeff").upper() for col in frame.columns]
+    if not {"TIME_PERIOD", "OBS_VALUE"}.issubset(frame.columns):
+        raise ValueError(f"IMF CSV lacks TIME_PERIOD / OBS_VALUE. Columns: {list(frame.columns)[:12]}")
+    rows = []
+    for period, raw in zip(frame["TIME_PERIOD"], frame["OBS_VALUE"]):
+        try:
+            month = pd.Period(str(period)[:7], freq="M")
+            value = float(raw)
+            if pd.notna(value) and 0 < value < float("inf"):
+                rows.append((month, value))
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return _make_series(rows, indicator)
 
 
 @st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
 def fetch_indicator(code: str, kind: str, start: str, end: str) -> pd.Series:
-    """Fetch CPI or FX from the exact IMF.STA SDMX 3.0 dataflow templates."""
+    """Retrieve monthly IMF data, preferring SDMX-CSV over version-dependent JSON."""
     if kind == "CPI":
         flow, key = "CPI", f"{code}.CPI._T.IX.M"
     elif kind == "FX":
         flow, key = "ER", f"{code}.XDC_USD.PA_RT.M"
     else:
         raise ValueError(f"Unsupported series type: {kind}")
-
-    # The IMF examples encode the time constraint as:
-    # c[TIME_PERIOD]=ge:YYYY-MM+le:YYYY-MM
     url = f"{BASE}/data/dataflow/IMF.STA/{flow}/+/{key}"
     params = {"c[TIME_PERIOD]": f"ge:{start}+le:{end}"}
-    try:
-        response = requests.get(
-            url, params=params,
-            headers={"Accept": "application/vnd.sdmx.data+json;version=2, application/json"},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"IMF {flow} request failed for {code}: {exc}") from exc
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError(f"IMF returned non-JSON data for {code} {flow}.") from exc
-    return extract_series(payload, f"{code} {kind}")
+    errors = []
+    # CSV is easier to parse reliably and avoids the differing JSON schemas.
+    for accept in ("csvfile", "application/vnd.sdmx.data+csv;version=2", "application/vnd.sdmx.data+json;version=2"):
+        try:
+            response = requests.get(url, params=params, headers={"Accept": accept}, timeout=TIMEOUT)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "json" in content_type or response.text.lstrip().startswith("{"):
+                result = extract_series(response.json(), f"{code} {kind}")
+            else:
+                result = extract_csv(response.text, f"{code} {kind}")
+            return result
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            errors.append(f"{accept}: {str(exc)[:220]}")
+    raise RuntimeError(
+        f"Could not retrieve {code} {kind} from IMF. URL: {url}. "
+        f"Server responses: {' | '.join(errors)}. "
+        "Check the IMF API response and available formats; no data was substituted."
+    )
 
 
 def usd_fx(start: pd.Period, end: pd.Period) -> pd.Series:
