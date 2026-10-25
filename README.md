@@ -59,11 +59,3 @@ Missing, zero, negative, or nonnumeric observations are excluded from calculatio
 ## Important limitation
 
 The endpoint templates match the supplied tested public URLs, but a live end-to-end IMF response was not accessible for verification here. If the IMF changes its SDMX response schema or country coverage, an update may be required.
-
-
-## Parser update
-
-The app now tries SDMX-CSV first, with alternate CSV and SDMX-JSON response types as fallbacks.
-If the IMF responds with an unsupported structure, the error reports the request URL and
-format-specific diagnostic information rather than claiming the country has no data.
-Live IMF network requests were not verified in the development environment.
