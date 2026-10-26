@@ -125,9 +125,9 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
         .agg(["count", "nunique", "min", "max"]))
     conflicts = conflicts[conflicts["nunique"] > 1]
     if not conflicts.empty:
-    raise ValueError(
-        f"IMF returned conflicting values for {indicator}. "
-        f"Conflict details: {conflicts.head(5).to_dict('index')}")
+        raise ValueError(
+            f"IMF returned conflicting values for {indicator}. "
+            f"Conflict details: {conflicts.head(5).to_dict('index')}")
     return (frame.drop_duplicates("month").set_index("month")["value"]
             .sort_index().rename(indicator))
 
