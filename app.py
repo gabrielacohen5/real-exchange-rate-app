@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+import re
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -94,8 +95,22 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
                 if len(parts) <= time_pos:
                     continue
                 time_item = time_values[parts[time_pos]]
-                month_text = time_item.get("id", time_item.get("value", "")) if isinstance(time_item, dict) else str(time_item)
-                month = pd.Period(str(month_text)[:7], freq="M")
+                # SDMX 2.x time entries may expose an annual-looking `id`
+                # alongside the actual monthly `value` (YYYY-MM). Prefer
+                # the monthly value; never coerce a bare year to January.
+                if isinstance(time_item, dict):
+                    candidates = [time_item.get("value"), time_item.get("id")]
+                else:
+                    candidates = [time_item]
+                month_text = next(
+                    (str(candidate)[:7] for candidate in candidates
+                     if candidate is not None and
+                     re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])(?:-\d{2})?", str(candidate))),
+                    None,
+                )
+                if month_text is None:
+                    raise ValueError(f"No monthly TIME_PERIOD in {time_item!r}")
+                month = pd.Period(month_text, freq="M")
                 if isinstance(observation, dict):
                     raw = observation.get("value", observation.get("obsValue"))
                 elif isinstance(observation, (list, tuple)):
@@ -117,17 +132,12 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
             for series in series_collection.values():
                 if isinstance(series, dict):
                     add_observations(series.get("observations", {}))
+
     if not rows:
         return pd.Series(dtype=float, name=indicator)
     frame = pd.DataFrame(rows, columns=["month", "value"])
-    conflicts = (
-        frame.groupby("month")["value"]
-        .agg(["count", "nunique", "min", "max"]))
-    conflicts = conflicts[conflicts["nunique"] > 1]
-    if not conflicts.empty:
-        raise ValueError(
-            f"IMF returned conflicting values for {indicator}. "
-            f"Conflict details: {conflicts.head(5).to_dict('index')}")
+    if frame.groupby("month")["value"].nunique().gt(1).any():
+        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
     return (frame.drop_duplicates("month").set_index("month")["value"]
             .sort_index().rename(indicator))
 
