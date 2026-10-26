@@ -28,41 +28,80 @@ def month_bounds(start: pd.Period, end: pd.Period) -> tuple[str, str]:
 
 
 def extract_series(payload: object, indicator: str) -> pd.Series:
-    """Read SDMX-JSON 2.0 or 1.0, including series-level observations."""
-    if not isinstance(payload, dict):
-        raise ValueError("IMF returned a non-object JSON response.")
+    """Parse common SDMX-JSON 1.x/2.x envelopes and observation representations.
 
-    # SDMX-JSON 2.0: data + structures; SDMX-JSON 1.0: dataSets + structure.
-    if "data" in payload and "structures" in payload:
-        datasets = payload.get("data") or []
-        structures = payload.get("structures") or []
-        if not structures:
-            return pd.Series(dtype=float, name=indicator)
-        structure = structures[0]
-    elif "dataSets" in payload and "structure" in payload:
-        datasets = payload.get("dataSets") or []
-        structure = payload["structure"]
+    IMF SDMX 3.0 is an API protocol version, not a guarantee about the JSON
+    representation. Unexpected/error payloads are reported with useful context.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"IMF {indicator}: JSON response was not an object.")
+
+    def describe_error(obj: dict) -> str | None:
+        for key in ("error", "errors", "message", "detail", "title"):
+            if obj.get(key):
+                return str(obj[key])[:500]
+        return None
+
+    # Some gateways nest the SDMX payload under 'data'. Others use a top-level
+    # 'dataSets' (SDMX-JSON 1.x) or 'data' array (SDMX-JSON 2.x).
+    root = payload
+    for _ in range(3):
+        if any(k in root for k in ("dataSets", "datasets", "structures")):
+            break
+        nested = root.get("data")
+        if isinstance(nested, dict):
+            root = nested
+        else:
+            break
+
+    error = describe_error(root) or describe_error(payload)
+    if error and not any(k in root for k in ("dataSets", "datasets", "structures")):
+        raise ValueError(f"IMF {indicator} API message: {error}")
+
+    datasets = root.get("dataSets", root.get("datasets", root.get("data", [])))
+    structures = root.get("structures", root.get("structure", {}))
+    if isinstance(datasets, dict):
+        datasets = datasets.get("dataSets", datasets.get("datasets", [datasets]))
+    if isinstance(structures, list):
+        structure = structures[0] if structures else {}
     else:
-        raise ValueError("Unexpected IMF JSON layout; expected SDMX-JSON 1.0 or 2.0.")
+        structure = structures
+    if not isinstance(datasets, list) or not isinstance(structure, dict):
+        raise ValueError(f"IMF {indicator}: unrecognized SDMX JSON structure. "
+                         f"Top-level fields: {list(payload)[:12]}. "
+                         "Check the requested dataflow and response content type.")
 
     dimensions = structure.get("dimensions", {})
-    obs_dims = dimensions.get("observation", [])
-    series_dims = dimensions.get("series", [])
+    if isinstance(dimensions, list):
+        # Some SDMX-JSON 2.0 responses represent dimensions as a flat array.
+        obs_dims = dimensions
+    else:
+        obs_dims = dimensions.get("observation", [])
     time_pos = next((i for i, dim in enumerate(obs_dims)
-                     if dim.get("id", "").upper() in {"TIME_PERIOD", "TIME"}), None)
+                     if str(dim.get("id", "")).upper() in ("TIME_PERIOD", "TIME")), None)
     if time_pos is None:
-        raise ValueError("IMF response does not identify a TIME_PERIOD dimension.")
+        raise ValueError(f"IMF {indicator}: no TIME_PERIOD observation dimension. "
+                         f"Structure fields: {list(structure)[:12]}")
     time_values = obs_dims[time_pos].get("values", [])
     rows = []
 
-    def add_observations(observations: dict) -> None:
+    def add_observations(observations: object) -> None:
+        if not isinstance(observations, dict):
+            return
         for key, observation in observations.items():
             try:
                 parts = [int(part) for part in str(key).split(":")]
                 if len(parts) <= time_pos:
                     continue
-                month = pd.Period(str(time_values[parts[time_pos]]["id"])[:7], freq="M")
-                raw = observation[0] if isinstance(observation, (list, tuple)) and observation else observation
+                time_item = time_values[parts[time_pos]]
+                month_text = time_item.get("id", time_item.get("value", "")) if isinstance(time_item, dict) else str(time_item)
+                month = pd.Period(str(month_text)[:7], freq="M")
+                if isinstance(observation, dict):
+                    raw = observation.get("value", observation.get("obsValue"))
+                elif isinstance(observation, (list, tuple)):
+                    raw = observation[0] if observation else None
+                else:
+                    raw = observation
                 value = float(raw)
                 if pd.notna(value) and 0 < value < float("inf"):
                     rows.append((month, value))
@@ -70,9 +109,14 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
                 continue
 
     for dataset in datasets:
+        if not isinstance(dataset, dict):
+            continue
         add_observations(dataset.get("observations", {}))
-        for series in dataset.get("series", {}).values():
-            add_observations(series.get("observations", {}))
+        series_collection = dataset.get("series", {})
+        if isinstance(series_collection, dict):
+            for series in series_collection.values():
+                if isinstance(series, dict):
+                    add_observations(series.get("observations", {}))
 
     if not rows:
         return pd.Series(dtype=float, name=indicator)
@@ -100,7 +144,7 @@ def fetch_indicator(code: str, kind: str, start: str, end: str) -> pd.Series:
     try:
         response = requests.get(
             url, params=params,
-            headers={"Accept": "application/vnd.sdmx.data+json;version=2, application/json"},
+            headers={"Accept": "application/vnd.sdmx.data+json;version=2.0, application/vnd.sdmx.data+json;version=1.0;q=0.9, application/json;q=0.8"},
             timeout=TIMEOUT,
         )
         response.raise_for_status()
@@ -110,7 +154,11 @@ def fetch_indicator(code: str, kind: str, start: str, end: str) -> pd.Series:
         payload = response.json()
     except ValueError as exc:
         raise ValueError(f"IMF returned non-JSON data for {code} {flow}.") from exc
-    return extract_series(payload, f"{code} {kind}")
+    try:
+        return extract_series(payload, f"{code} {kind}")
+    except ValueError as exc:
+        raise ValueError(f"{exc} | URL: {response.url} | Content-Type: "
+                         f"{response.headers.get('Content-Type', 'unknown')}") from exc
 
 
 def usd_fx(start: pd.Period, end: pd.Period) -> pd.Series:
