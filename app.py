@@ -1,302 +1,233 @@
-"""Real Exchange Rate Explorer — IMF SDMX 3.0 monthly data."""
+"""IMF monthly bilateral real exchange rate explorer (Python 3.12)."""
 from __future__ import annotations
 
-from datetime import date
+import io
 import re
+from datetime import date
+from xml.etree import ElementTree as ET
 
 import pandas as pd
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import pycountry
 import requests
 import streamlit as st
 
 BASE = "https://api.imf.org/external/sdmx/3.0"
-EARLIEST = pd.Period("1976-01", freq="M")
+START = pd.Period("1976-01", freq="M")
 TIMEOUT = 35
 
-st.set_page_config(page_title="Real Exchange Rate Explorer", page_icon="🌐", layout="wide")
+# ISO3 codes; G163 is the IMF Euro area aggregate.
+COUNTRIES = {
+    "Argentina": "ARG", "Australia": "AUS", "Austria": "AUT", "Belgium": "BEL",
+    "Brazil": "BRA", "Canada": "CAN", "Chile": "CHL", "China": "CHN",
+    "Colombia": "COL", "Czechia": "CZE", "Denmark": "DNK", "Egypt": "EGY",
+    "Euro area": "G163", "Finland": "FIN", "France": "FRA", "Germany": "DEU",
+    "Greece": "GRC", "Hong Kong SAR": "HKG", "Hungary": "HUN", "India": "IND",
+    "Indonesia": "IDN", "Ireland": "IRL", "Israel": "ISR", "Italy": "ITA",
+    "Japan": "JPN", "Kenya": "KEN", "Malaysia": "MYS", "Mexico": "MEX",
+    "Netherlands": "NLD", "New Zealand": "NZL", "Nigeria": "NGA", "Norway": "NOR",
+    "Pakistan": "PAK", "Peru": "PER", "Philippines": "PHL", "Poland": "POL",
+    "Portugal": "PRT", "Romania": "ROU", "Saudi Arabia": "SAU", "Singapore": "SGP",
+    "South Africa": "ZAF", "South Korea": "KOR", "Spain": "ESP", "Sweden": "SWE",
+    "Switzerland": "CHE", "Thailand": "THA", "Türkiye": "TUR", "Ukraine": "UKR",
+    "United Kingdom": "GBR", "United States": "USA", "Vietnam": "VNM",
+}
 
 
-def countries() -> dict[str, str]:
-    result = {f"{c.name} ({c.alpha_3})": c.alpha_3 for c in pycountry.countries}
-    result["Euro area (G163)"] = "G163"
-    return dict(sorted(result.items()))
+class IMFError(RuntimeError):
+    pass
 
 
-def month_bounds(start: pd.Period, end: pd.Period) -> tuple[str, str]:
-    return str(start), str(end)
-
-
-def extract_series(payload: object, indicator: str) -> pd.Series:
-    """Parse common SDMX-JSON 1.x/2.x envelopes and observation representations.
-
-    IMF SDMX 3.0 is an API protocol version, not a guarantee about the JSON
-    representation. Unexpected/error payloads are reported with useful context.
-    """
-    if not isinstance(payload, dict):
-        raise ValueError(f"IMF {indicator}: JSON response was not an object.")
-
-    def describe_error(obj: dict) -> str | None:
-        for key in ("error", "errors", "message", "detail", "title"):
-            if obj.get(key):
-                return str(obj[key])[:500]
+def parse_month(value: object) -> pd.Period | None:
+    """Parse an IMF monthly time label without accidentally accepting annual data."""
+    s = str(value).strip()
+    match = re.match(r"^(\d{4})[-/]?M?(0?[1-9]|1[0-2])$", s, re.I)
+    if not match:
         return None
+    return pd.Period(f"{match.group(1)}-{int(match.group(2)):02d}", freq="M")
 
-    # Some gateways nest the SDMX payload under 'data'. Others use a top-level
-    # 'dataSets' (SDMX-JSON 1.x) or 'data' array (SDMX-JSON 2.x).
-    root = payload
-    for _ in range(3):
-        if any(k in root for k in ("dataSets", "datasets", "structures")):
-            break
-        nested = root.get("data")
-        if isinstance(nested, dict):
-            root = nested
-        else:
-            break
 
-    error = describe_error(root) or describe_error(payload)
-    if error and not any(k in root for k in ("dataSets", "datasets", "structures")):
-        raise ValueError(f"IMF {indicator} API message: {error}")
+def parse_csv(payload: bytes) -> pd.Series:
+    """Read SDMX CSV in either compact or generic form; reject ambiguous duplicates."""
+    frame = pd.read_csv(io.BytesIO(payload), dtype=str, keep_default_na=False)
+    frame.columns = [c.strip().upper() for c in frame.columns]
+    time_col = next((c for c in ("TIME_PERIOD", "TIME_PERIOD_ID") if c in frame), None)
+    value_col = next((c for c in ("OBS_VALUE", "OBS_VALUE_NUM") if c in frame), None)
+    if not time_col or not value_col:
+        raise IMFError("The IMF response did not contain TIME_PERIOD and OBS_VALUE columns.")
+    frame["month"] = frame[time_col].map(parse_month)
+    frame = frame.loc[frame["month"].notna()].copy()
+    frame["value"] = pd.to_numeric(frame[value_col], errors="coerce")
+    frame = frame.loc[frame["value"].notna() & (frame["value"] > 0)]
+    if frame.empty:
+        return pd.Series(dtype="float64")
+    # Duplicate months with identical values are safe; conflicting values are not.
+    conflicts = frame.groupby("month")["value"].nunique()
+    if (conflicts > 1).any():
+        examples = ", ".join(str(p) for p in conflicts[conflicts > 1].index[:4])
+        raise IMFError(f"IMF returned conflicting values for months: {examples}. Check the series dimensions.")
+    return frame.drop_duplicates("month").set_index("month")["value"].sort_index().astype(float)
 
-    datasets = root.get("dataSets", root.get("datasets", root.get("data", [])))
-    structures = root.get("structures", root.get("structure", {}))
-    if isinstance(datasets, dict):
-        datasets = datasets.get("dataSets", datasets.get("datasets", [datasets]))
-    if isinstance(structures, list):
-        structure = structures[0] if structures else {}
-    else:
-        structure = structures
-    if not isinstance(datasets, list) or not isinstance(structure, dict):
-        raise ValueError(f"IMF {indicator}: unrecognized SDMX JSON structure. "
-                         f"Top-level fields: {list(payload)[:12]}. "
-                         "Check the requested dataflow and response content type.")
 
-    dimensions = structure.get("dimensions", {})
-    if isinstance(dimensions, list):
-        # Some SDMX-JSON 2.0 responses represent dimensions as a flat array.
-        obs_dims = dimensions
-    else:
-        obs_dims = dimensions.get("observation", [])
-    time_pos = next((i for i, dim in enumerate(obs_dims)
-                     if str(dim.get("id", "")).upper() in ("TIME_PERIOD", "TIME")), None)
-    if time_pos is None:
-        raise ValueError(f"IMF {indicator}: no TIME_PERIOD observation dimension. "
-                         f"Structure fields: {list(structure)[:12]}")
-    time_values = obs_dims[time_pos].get("values", [])
-    rows = []
-
-    def add_observations(observations: object) -> None:
-        if not isinstance(observations, dict):
-            return
-        for key, observation in observations.items():
-            try:
-                parts = [int(part) for part in str(key).split(":")]
-                if len(parts) <= time_pos:
-                    continue
-                time_item = time_values[parts[time_pos]]
-                # SDMX 2.x time entries may expose an annual-looking `id`
-                # alongside the actual monthly `value` (YYYY-MM). Prefer
-                # the monthly value; never coerce a bare year to January.
-                if isinstance(time_item, dict):
-                    candidates = [time_item.get("value"), time_item.get("id")]
-                else:
-                    candidates = [time_item]
-                month_text = next(
-                    (str(candidate)[:7] for candidate in candidates
-                     if candidate is not None and
-                     re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])(?:-\d{2})?", str(candidate))),
-                    None,
-                )
-                if month_text is None:
-                    raise ValueError(f"No monthly TIME_PERIOD in {time_item!r}")
-                month = pd.Period(month_text, freq="M")
-                if isinstance(observation, dict):
-                    raw = observation.get("value", observation.get("obsValue"))
-                elif isinstance(observation, (list, tuple)):
-                    raw = observation[0] if observation else None
-                else:
-                    raw = observation
-                value = float(raw)
-                if pd.notna(value) and 0 < value < float("inf"):
-                    rows.append((month, value))
-            except (ValueError, TypeError, IndexError, KeyError, OverflowError):
-                continue
-
-    for dataset in datasets:
-        if not isinstance(dataset, dict):
+def parse_xml(payload: bytes) -> pd.Series:
+    """Parse SDMX-ML generic/structure-specific observations."""
+    root = ET.fromstring(payload)
+    values: list[tuple[pd.Period, float]] = []
+    for obs in root.iter():
+        if obs.tag.rsplit("}", 1)[-1] != "Obs":
             continue
-        add_observations(dataset.get("observations", {}))
-        series_collection = dataset.get("series", {})
-        if isinstance(series_collection, dict):
-            for series in series_collection.values():
-                if isinstance(series, dict):
-                    add_observations(series.get("observations", {}))
-
-    if not rows:
-        return pd.Series(dtype=float, name=indicator)
-    frame = pd.DataFrame(rows, columns=["month", "value"])
-    if frame.groupby("month")["value"].nunique().gt(1).any():
-        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
-    return (frame.drop_duplicates("month").set_index("month")["value"]
-            .sort_index().rename(indicator))
-
-
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
-def fetch_indicator(code: str, kind: str, start: str, end: str) -> pd.Series:
-    """Fetch CPI or FX from the exact IMF.STA SDMX 3.0 dataflow templates."""
-    if kind == "CPI":
-        flow, key = "CPI", f"{code}.CPI._T.IX.M"
-    elif kind == "FX":
-        flow, key = "ER", f"{code}.XDC_USD.PA_RT.M"
-    else:
-        raise ValueError(f"Unsupported series type: {kind}")
-
-    # The IMF examples encode the time constraint as:
-    # c[TIME_PERIOD]=ge:YYYY-MM+le:YYYY-MM
-    url = f"{BASE}/data/dataflow/IMF.STA/{flow}/+/{key}"
-    params = {"c[TIME_PERIOD]": f"ge:{start}+le:{end}"}
-    try:
-        response = requests.get(
-            url, params=params,
-            headers={"Accept": "application/vnd.sdmx.data+json;version=2.0, application/vnd.sdmx.data+json;version=1.0;q=0.9, application/json;q=0.8"},
-            timeout=TIMEOUT,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"IMF {flow} request failed for {code}: {exc}") from exc
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise ValueError(f"IMF returned non-JSON data for {code} {flow}.") from exc
-    try:
-        return extract_series(payload, f"{code} {kind}")
-    except ValueError as exc:
-        raise ValueError(f"{exc} | URL: {response.url} | Content-Type: "
-                         f"{response.headers.get('Content-Type', 'unknown')}") from exc
+        month = parse_month(obs.attrib.get("TIME_PERIOD", ""))
+        raw = obs.attrib.get("OBS_VALUE")
+        for child in obs:
+            name = child.tag.rsplit("}", 1)[-1]
+            if name == "ObsDimension":
+                month = parse_month(child.attrib.get("value", ""))
+            elif name == "ObsValue":
+                raw = child.attrib.get("value")
+        try:
+            value = float(raw) if raw is not None else float("nan")
+        except ValueError:
+            continue
+        if month is not None and pd.notna(value) and value > 0:
+            values.append((month, value))
+    if not values:
+        return pd.Series(dtype="float64")
+    frame = pd.DataFrame(values, columns=["month", "value"])
+    conflicts = frame.groupby("month")["value"].nunique()
+    if (conflicts > 1).any():
+        raise IMFError("IMF XML contains conflicting values for the same month.")
+    return frame.drop_duplicates("month").set_index("month")["value"].sort_index()
 
 
-def usd_fx(start: pd.Period, end: pd.Period) -> pd.Series:
-    """USD per USD is exactly one; no IMF exchange-rate call required."""
-    return pd.Series(1.0, index=pd.period_range(start, end, freq="M"), name="USA FX")
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_series(iso3: str, indicator: str) -> pd.Series:
+    """Fetch one explicitly keyed monthly IMF series; never substitute other indicators."""
+    key = f"{iso3}.{indicator}.M"
+    # IMF external SDMX 3.0: dataflow ID and complete dimension key.
+    # Dataflow names differ across IMF migrations; try both the user-specified
+    # compact indicator dataflow and the legacy-compatible IFS dataflow.
+    endpoints = [
+        f"{BASE}/data/IMF.STA,IFS,1.0/{key}",
+        f"{BASE}/data/IMF.STA,IFS,1.1/{key}",
+    ]
+    errors = []
+    for endpoint in endpoints:
+        try:
+            response = requests.get(
+                endpoint,
+                params={"startPeriod": "1976-01", "format": "csvfile"},
+                headers={"Accept": "text/csv, application/vnd.sdmx.csv;version=2, application/vnd.sdmx.csv"},
+                timeout=TIMEOUT,
+            )
+            response.raise_for_status()
+            content = response.content
+            series = parse_xml(content) if content.lstrip().startswith(b"<") else parse_csv(content)
+            if not series.empty:
+                return series.loc[series.index >= START]
+            errors.append("No positive monthly observations")
+        except (requests.RequestException, ValueError, ET.ParseError, IMFError) as exc:
+            errors.append(str(exc)[:180])
+    raise IMFError(f"Could not retrieve {key}. IMF API responses: {' | '.join(errors)}")
 
 
-def calculate(cpi1: pd.Series, cpi2: pd.Series, fx1: pd.Series, fx2: pd.Series,
-              start: pd.Period, end: pd.Period, name1: str, name2: str) -> tuple[pd.DataFrame, float]:
-    months = pd.period_range(start, end, freq="M")
-    df = pd.DataFrame(index=months)
-    df["Country 1"] = name1
-    df["Country 2"] = name2
-    df["CPI Country 1"] = cpi1.reindex(months)
-    df["CPI Country 2"] = cpi2.reindex(months)
-    df["FX Country 1 (LCU/USD)"] = fx1.reindex(months)
-    df["FX Country 2 (LCU/USD)"] = fx2.reindex(months)
-    df["Nominal S (Country 2 / Country 1)"] = df["FX Country 2 (LCU/USD)"] / df["FX Country 1 (LCU/USD)"]
-    df["RER"] = df["Nominal S (Country 2 / Country 1)"] * df["CPI Country 1"] / df["CPI Country 2"]
-    df["RER"] = df["RER"].where(df["RER"].gt(0) & df["RER"].map(pd.notna))
-    benchmark = float(df["RER"].mean())
-    df["Benchmark RER*"] = benchmark
-    df["Real Index (100 = period mean)"] = 100 * df["RER"] / benchmark if pd.notna(benchmark) and benchmark > 0 else float("nan")
-    df.index.name = "Date"
-    return df, benchmark
+def compute(country1: str, country2: str) -> pd.DataFrame:
+    cpi1 = fetch_series(country1, "CPI._T.IX")
+    cpi2 = fetch_series(country2, "CPI._T.IX")
+    fx1 = fetch_series(country1, "XDC_USD.PA_RT")
+    fx2 = fetch_series(country2, "XDC_USD.PA_RT")
+    df = pd.concat({"P1": cpi1, "P2": cpi2, "XDC_per_USD_1": fx1, "XDC_per_USD_2": fx2}, axis=1)
+    # (Country 2 currency / USD) / (Country 1 currency / USD)
+    df["S"] = df["XDC_per_USD_2"] / df["XDC_per_USD_1"]
+    df["RER"] = df["S"] * df["P1"] / df["P2"]
+    return df.sort_index()
 
 
-def chart(df: pd.DataFrame, view: str, name1: str, name2: str) -> go.Figure:
-    both = view == "Both"
-    fig = make_subplots(specs=[[{"secondary_y": True}]]) if both else go.Figure()
-    x = df.index.to_timestamp()
-    real = df["Real Index (100 = period mean)"]
-    nominal = df["Nominal S (Country 2 / Country 1)"]
-    if view in ("Real", "Both"):
-        trace = go.Scatter(x=x, y=real, name="Real exchange rate index", mode="lines", line=dict(color="#5b50c8", width=2.5), connectgaps=False)
-        if both:
-            fig.add_trace(trace, secondary_y=False)
-            fig.add_hline(y=100, line_dash="dash", line_color="gray", annotation_text="Period mean = 100", secondary_y=False)
-        else:
-            fig.add_trace(trace)
-            fig.add_hline(y=100, line_dash="dash", line_color="gray", annotation_text="Period mean = 100")
-    if view in ("Nominal", "Both"):
-        trace = go.Scatter(x=x, y=nominal, name="Nominal exchange rate", mode="lines", line=dict(color="#e38b3d", width=2.3), connectgaps=False)
-        if both:
-            fig.add_trace(trace, secondary_y=True)
-        else:
-            fig.add_trace(trace)
-    if both:
-        fig.update_yaxes(title_text="Real index (period average = 100)", secondary_y=False)
-        fig.update_yaxes(title_text=f"{name2} currency units per 1 {name1} currency unit", secondary_y=True)
-    else:
-        fig.update_yaxes(title_text="Real index (period average = 100)" if view == "Real" else f"{name2} currency units per 1 {name1} currency unit")
-    fig.update_layout(title=f"{name1} vs {name2}", xaxis_title="Month", hovermode="x unified", legend=dict(orientation="h", y=1.08), height=540, margin=dict(t=90, b=35))
-    return fig
+st.set_page_config(page_title="IMF Real Exchange Rate Explorer", page_icon="🌍", layout="wide")
+st.title("IMF Real Exchange Rate Explorer")
+st.caption("Monthly CPI and exchange-rate data · IMF · January 1976 onward where available")
 
+names = sorted(COUNTRIES)
+left, right = st.columns(2)
+with left:
+    name1 = st.selectbox("Country 1 (base currency)", names, index=names.index("United States"))
+with right:
+    name2 = st.selectbox("Country 2 (quote currency)", names, index=names.index("Euro area"))
+if name1 == name2:
+    st.warning("Select two different economies.")
+    st.stop()
 
-def main() -> None:
-    st.title("🌐 Real Exchange Rate Explorer")
-    st.caption("Monthly IMF observations · Inflation-adjusted currency comparisons")
-    st.markdown("Compare currencies using monthly consumer prices and exchange rates. The real index is centered on **100**, the average over your selected period.")
-    opts = countries()
-    labels = list(opts)
-    def default(code: str) -> int:
-        return next((i for i, name in enumerate(labels) if opts[name] == code), 0)
-    with st.sidebar:
-        st.header("Analysis settings")
-        c1 = st.selectbox("Country 1 (base currency)", labels, index=default("USA"))
-        c2 = st.selectbox("Country 2 (quote currency)", labels, index=default("G163"))
-        now = pd.Period(date.today(), freq="M")
-        years = list(range(1976, now.year + 1))
-        sy = st.selectbox("Start year", years, index=years.index(max(1976, now.year - 10)))
-        sm = st.selectbox("Start month", list(range(1, 13)), index=0, format_func=lambda m: date(2000, m, 1).strftime("%B"))
-        ey = st.selectbox("End year", years, index=len(years)-1)
-        em = st.selectbox("End month", list(range(1, 13)), index=min(now.month, 12)-1, format_func=lambda m: date(2000, m, 1).strftime("%B"))
-        view = st.radio("Display", ["Real", "Nominal", "Both"], index=2, horizontal=True)
-        run = st.button("Analyze exchange rates", type="primary", use_container_width=True)
-    if not run:
-        st.info("Choose two countries and a date range, then select **Analyze exchange rates**.")
-        return
-    start, end = pd.Period(f"{sy}-{sm:02d}", freq="M"), pd.Period(f"{ey}-{em:02d}", freq="M")
-    if start < EARLIEST or end > now or start > end:
-        st.error("Choose a valid range from January 1976 through the current month, with the start before the end.")
-        return
-    if opts[c1] == opts[c2]:
-        st.error("Select two different countries or currency areas.")
-        return
-    code1, code2 = opts[c1], opts[c2]
-    names = (c1.rsplit(" (", 1)[0], c2.rsplit(" (", 1)[0])
-    try:
-        with st.spinner("Retrieving IMF observations…"):
-            cpi1 = fetch_indicator(code1, "CPI", str(start), str(end))
-            cpi2 = fetch_indicator(code2, "CPI", str(start), str(end))
-            fx1 = usd_fx(start, end) if code1 == "USA" else fetch_indicator(code1, "FX", str(start), str(end))
-            fx2 = usd_fx(start, end) if code2 == "USA" else fetch_indicator(code2, "FX", str(start), str(end))
-            df, benchmark = calculate(cpi1, cpi2, fx1, fx2, start, end, *names)
-    except (RuntimeError, ValueError, requests.RequestException) as exc:
-        st.error(str(exc))
-        st.info("Check the country code, requested months, and IMF data availability. Some countries have limited CPI or FX coverage.")
-        return
-    valid = int(df["RER"].notna().sum())
-    if valid == 0:
-        st.warning("No months contain all four required valid observations. Try a shorter or more recent period or different countries.")
-        return
-    if valid < len(df):
-        st.warning(f"{len(df) - valid} of {len(df)} months lack at least one required value. The benchmark uses only {valid} complete months.")
-    a, b, c = st.columns(3)
-    a.metric("Complete months", f"{valid} / {len(df)}")
-    b.metric("Benchmark RER*", f"{benchmark:,.4f}")
-    c.metric("Latest real index", f"{df['Real Index (100 = period mean)'].dropna().iloc[-1]:,.2f}")
-    st.plotly_chart(chart(df, view, *names), use_container_width=True)
-    st.caption("Index above 100: Country 1 is relatively more depreciated than its selected-period average. Below 100: relatively more appreciated. This is not a causal or equilibrium valuation estimate.")
-    st.subheader("Monthly data and calculations")
-    export = df.reset_index()
-    export["Date"] = export["Date"].astype(str)
-    st.dataframe(export, use_container_width=True, hide_index=True)
-    st.download_button("Download CSV", data=export.to_csv(index=False).encode("utf-8-sig"), file_name=f"rer_{code1}_{code2}_{start}_{end}.csv", mime="text/csv")
-    with st.expander("Calculation methodology"):
-        st.latex(r"S_t = E_{2,t}/E_{1,t}")
-        st.latex(r"RER_t = S_t (P_{1,t}/P_{2,t})")
-        st.latex(r"RER^* = \frac{1}{N}\sum_{t\in\text{valid months}} RER_t")
-        st.latex(r"RealIndex_t = 100\frac{RER_t}{RER^*}")
-        st.write("E is local currency units per USD. The nominal series is not normalized. CPI base-year conventions can affect RER levels, but not the normalized index if consistent within each series.")
+st.latex(r"S_t = \frac{\text{Country 2 currency}}{\text{Country 1 currency}},\qquad RER_t=S_t\frac{P_{1,t}}{P_{2,t}}")
 
+try:
+    with st.spinner("Fetching monthly IMF data…"):
+        full = compute(COUNTRIES[name1], COUNTRIES[name2])
+except IMFError as exc:
+    st.error(str(exc))
+    st.info("The IMF may not publish these series for the selected economy, or its SDMX dataflow may be temporarily unavailable. Try another country pair or retry later.")
+    st.stop()
 
-if __name__ == "__main__":
-    main()
+valid = full.dropna(subset=["RER", "S"])
+if valid.empty:
+    st.warning("There are no months with both CPI series and both exchange-rate series. Try another pair.")
+    st.stop()
+
+first, last = valid.index.min(), valid.index.max()
+st.caption(f"Overlapping observations available: {first} to {last} ({len(valid):,} valid months).")
+col_a, col_b, col_c = st.columns([1, 1, 1])
+with col_a:
+    start_date = st.date_input("Start month", value=first.to_timestamp().date(), min_value=first.to_timestamp().date(), max_value=last.to_timestamp().date())
+with col_b:
+    end_date = st.date_input("End month", value=last.to_timestamp().date(), min_value=first.to_timestamp().date(), max_value=last.to_timestamp().date())
+with col_c:
+    view = st.radio("Display", ["Real", "Nominal", "Both"], horizontal=True, index=2)
+start = pd.Period(start_date, freq="M")
+end = pd.Period(end_date, freq="M")
+if start > end:
+    st.error("Start month must be before or equal to end month.")
+    st.stop()
+
+# Reindex to preserve gaps as missing rows in CSV and breaks in charts.
+months = pd.period_range(start, end, freq="M")
+sample = full.reindex(months).copy()
+benchmark = sample["RER"].mean(skipna=True)
+if pd.isna(benchmark) or benchmark <= 0:
+    st.warning("The selected period contains no valid RER observations. Expand the date range.")
+    st.stop()
+sample["RER_star"] = benchmark
+sample["Real_Index"] = 100 * sample["RER"] / benchmark
+sample.index.name = "Month"
+
+m1, m2, m3 = st.columns(3)
+m1.metric("Average RER (RER*)", f"{benchmark:,.4f}")
+m2.metric("Valid RER months", f"{sample['RER'].count():,} / {len(sample):,}")
+m3.metric("Latest real index in sample", f"{sample['Real_Index'].dropna().iloc[-1]:,.2f}")
+
+x = sample.index.to_timestamp()
+fig = go.Figure()
+if view in ("Real", "Both"):
+    fig.add_trace(go.Scatter(x=x, y=sample["Real_Index"], mode="lines", name="Real index (sample mean = 100)", connectgaps=False, yaxis="y"))
+    fig.add_hline(y=100, line_dash="dot", line_color="gray")
+if view in ("Nominal", "Both"):
+    fig.add_trace(go.Scatter(x=x, y=sample["S"], mode="lines", name=f"Nominal S ({name2} / {name1})", connectgaps=False, yaxis="y2" if view == "Both" else "y"))
+fig.update_layout(
+    title=f"{name1} vs {name2} · {start} to {end}",
+    xaxis_title="Month", hovermode="x unified", legend=dict(orientation="h", y=1.12),
+    yaxis=dict(title="Real index (sample mean = 100)" if view != "Nominal" else f"Country 2 currency per Country 1 currency"),
+    margin=dict(t=85),
+)
+if view == "Both":
+    fig.update_layout(yaxis2=dict(title="Nominal S (actual currency units)", overlaying="y", side="right", showgrid=False))
+st.plotly_chart(fig, use_container_width=True)
+
+export = sample.reset_index()
+export["Month"] = export["Month"].astype(str)
+st.download_button("Download sample CSV", data=export.to_csv(index=False).encode("utf-8"), file_name=f"imf_rer_{COUNTRIES[name1]}_{COUNTRIES[name2]}_{start}_{end}.csv", mime="text/csv")
+with st.expander("Data definitions and limitations"):
+    st.markdown("""
+- **P1, P2:** IMF monthly CPI index levels. **XDC_per_USD_1/2:** domestic currency per US dollar.
+- **S = XDC_per_USD_2 / XDC_per_USD_1**, in Country 2 currency per unit of Country 1 currency.
+- **RER = S × P1 / P2**. **RER\*** is the arithmetic mean of valid RER values *within the selected sample*.
+- **Real_Index = 100 × RER / RER\***. Nominal S is not normalized.
+- Missing, zero, or invalid source values are not filled. The CSV includes missing months with blank calculations.
+- IMF series availability varies by economy and time; CPI base years can differ, so the real index is benchmarked to the chosen sample.
+- IMF SDMX dataflows and indicator availability may change; API errors are reported rather than replaced with invented data.
+""")
