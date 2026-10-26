@@ -117,12 +117,17 @@ def extract_series(payload: object, indicator: str) -> pd.Series:
             for series in series_collection.values():
                 if isinstance(series, dict):
                     add_observations(series.get("observations", {}))
-
     if not rows:
         return pd.Series(dtype=float, name=indicator)
     frame = pd.DataFrame(rows, columns=["month", "value"])
-    if frame.groupby("month")["value"].nunique().gt(1).any():
-        raise ValueError(f"IMF returned conflicting values for {indicator} in the same month.")
+    conflicts = (
+        frame.groupby("month")["value"]
+        .agg(["count", "nunique", "min", "max"]))
+    conflicts = conflicts[conflicts["nunique"] > 1]
+    if not conflicts.empty:
+    raise ValueError(
+        f"IMF returned conflicting values for {indicator}. "
+        f"Conflict details: {conflicts.head(5).to_dict('index')}")
     return (frame.drop_duplicates("month").set_index("month")["value"]
             .sort_index().rename(indicator))
 
