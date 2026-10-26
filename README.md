@@ -1,8 +1,8 @@
-# IMF Real Exchange Rate Explorer
+# Real Exchange Rate Explorer
 
-A Python 3.12 / Streamlit app that charts bilateral nominal and real exchange rates using monthly IMF CPI and exchange-rate observations.
+Streamlit app using IMF SDMX 3.0 monthly CPI and exchange-rate data. Built from the user-provided working CSV-based implementation.
 
-## Run locally
+## Install and run (Python 3.12)
 
 ```bash
 python -m venv .venv
@@ -12,32 +12,25 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## GitHub + Streamlit Community Cloud
+Select two countries (including Euro area G163), a start and end month, and Real, Nominal or Both. Download the resulting CSV from the table.
 
-1. Create a GitHub repository and commit `app.py`, `requirements.txt`, and `README.md` at its root.
-2. In [Streamlit Community Cloud](https://share.streamlit.io/), select **Create app**, choose the repository and branch, and set the entry point to `app.py`.
-3. In advanced settings, choose **Python 3.12**, then deploy. The app makes live requests to the IMF API; no API key is required.
+## IMF source
 
-## Definitions
+The app deliberately retains the working implementation's **CSV** data route:
 
-Country 1 is the base currency; Country 2 is the quote currency. Let `X1` and `X2` denote the IMF's domestic-currency-per-USD exchange rates:
+- CPI: `https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/CPI/~/{ISO3}.CPI._T.IX.M`
+- FX: `https://api.imf.org/external/sdmx/3.0/data/dataflow/IMF.STA/ER/~/{ISO3}.XDC_USD.PA_RT.M`
 
-- `S = X2 / X1` (Country 2 currency per one unit of Country 1 currency)
-- `RER = S × CPI1 / CPI2`
-- `RER* = mean(RER)` across valid months in the user-selected sample
-- `Real Index = 100 × RER / RER*`
+The request uses `Accept: text/csv` and `c[TIME_PERIOD]=ge:1976-M01`. It parses explicit `TIME_PERIOD` and `OBS_VALUE` columns, avoiding the previously problematic SDMX-JSON dimension indexing. USD/USD is defined as 1. Availability differs by economy. Requests are cached for 12 hours.
 
-The real index is rebased each time the sample changes. Nominal `S` remains in actual currency units. **Both** uses two axes. The CSV contains source observations and calculated fields, with blanks for missing months.
+## Methodology
 
-## IMF source and limitations
-
-The app requests the IMF SDMX 3.0 API at `https://api.imf.org/external/sdmx/3.0` with monthly keys `{ISO3}.CPI._T.IX.M` and `{ISO3}.XDC_USD.PA_RT.M`, using `G163` for the Euro area. The app attempts IMF IFS dataflow versions 1.0 and 1.1 and reports API errors if unavailable. The IMF may migrate dataflows, change their dimension order, or not provide these indicators in a given release. If so, update the `fetch_series` endpoint and keys using the IMF's current SDMX dataflow metadata; the app does **not** substitute unrelated data.
-
-The included dropdown provides a broad curated selection of IMF economies plus the Euro area, **not a dynamically discovered exhaustive list of all IMF countries**. Extend `COUNTRIES` for additional ISO3 codes. Coverage starts January 1976 when available; later-starting CPI and FX series restrict the overlap. No interpolation or synthetic data is used. The CPI indices may have different reference years, and the resulting real index is a within-sample measure, not an absolute PPP valuation.
+`S = FX2 / FX1` (Country 2 units per Country 1 unit); `RER = S * CPI1 / CPI2`; `RER* = mean(valid monthly RER in selected period)`; `Real Index = 100 * RER / RER*`. Nominal S is never normalized. A rise in the index means Country 1 real depreciation under this convention. Missing observations are not filled.
 
 ## Troubleshooting
 
-- **HTTP 404/422 or empty response:** IMF may have changed the IFS dataflow, dimension order, or indicator availability. Inspect IMF SDMX metadata for the correct current flow.
-- **No overlapping data:** select another pair or inspect the available history.
-- **Conflicting monthly observations:** the API may be returning multiple distinct series under one key. Refine the SDMX dimensions rather than arbitrarily taking the first observation.
-- **HTTP 429/5xx or timeout:** wait and retry; cached successful responses last 24 hours.
+If no chart appears, expand **Data availability and diagnostics** to identify which series lacks overlapping months. If the IMF changes its CSV response format or dataflow, the app raises an informative error. Network access is required.
+
+## Verification
+
+Python syntax and local offline tests can be checked without IMF connectivity. Live API availability and coverage should be tested in your local environment.
