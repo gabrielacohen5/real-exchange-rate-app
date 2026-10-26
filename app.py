@@ -5,7 +5,8 @@ from datetime import date
 from io import StringIO
 import time
 
-import altair as alt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pandas as pd
 import pycountry
 import requests
@@ -98,102 +99,117 @@ def calculate(country1: str, country2: str) -> pd.DataFrame:
     return df
 
 
-st.set_page_config(page_title="IMF Real Exchange Rate Explorer", page_icon="🌍", layout="wide")
-st.title("🌍 IMF Real Exchange Rate Explorer")
-st.caption("Monthly IMF CPI and exchange-rate series · January 1976 onward, where available")
-st.latex(r"S_t = \frac{FX_{2,t}}{FX_{1,t}},\qquad RER_t=S_t\frac{P_{1,t}}{P_{2,t}},\qquad I_t=100\frac{RER_t}{\overline{RER}_{\mathrm{sample}}}")
+
+st.set_page_config(page_title="Real Exchange Rate Explorer", page_icon="🌍", layout="wide")
+st.markdown("""<style>
+.block-container {padding-top:2rem;max-width:1350px}
+h1,h2,h3 {color:#172a46}
+[data-testid="stSidebar"] {background:#f1f4f8}
+</style>""", unsafe_allow_html=True)
 
 labels = list(COUNTRIES)
 def chosen(code: str) -> int:
     return next((i for i, label in enumerate(labels) if COUNTRIES[label] == code), 0)
 
-c1, c2 = st.columns(2)
-with c1:
+with st.sidebar:
+    st.header("Analysis settings")
     label1 = st.selectbox("Country 1 (base currency)", labels, index=chosen("USA"))
-with c2:
     label2 = st.selectbox("Country 2 (quote currency)", labels, index=chosen("GBR"))
+    current = pd.Period(date.today(), freq="M")
+    years = list(range(1976, current.year + 1))
+    month_names = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    with st.form("analysis_form"):
+        start_year = st.selectbox("Start year", years, index=years.index(2016))
+        start_month = st.selectbox("Start month", month_names, index=0)
+        end_year = st.selectbox("End year", years, index=years.index(min(2023, current.year)))
+        end_month = st.selectbox("End month", month_names, index=11)
+        view = st.radio("Display", ["Real", "Nominal", "Both"], index=2, horizontal=True)
+        submitted = st.form_submit_button("Analyze exchange rates", use_container_width=True, type="primary")
+    st.caption("Source: IMF SDMX 3.0 • Monthly CPI and exchange rates")
+
 country1, country2 = COUNTRIES[label1], COUNTRIES[label2]
+start = pd.Period(f"{start_year}-{month_names.index(start_month)+1:02d}", freq="M")
+end = pd.Period(f"{end_year}-{month_names.index(end_month)+1:02d}", freq="M")
+st.title("🌍 Real Exchange Rate Explorer")
+st.caption("Monthly IMF observations · Inflation-adjusted currency comparisons")
+st.write("Compare currencies using monthly consumer prices and exchange rates. The real index averages 100 over your selected period.")
 if country1 == country2:
-    st.warning("Choose two different countries or areas.")
+    st.warning("Select two different countries or areas.")
     st.stop()
-
-with st.spinner("Downloading IMF monthly CPI and exchange-rate observations..."):
-    try:
-        all_data = calculate(country1, country2)
-    except Exception as exc:
-        st.error(str(exc))
-        st.info("The IMF service may be temporarily unavailable, or its dataset/key may have changed. See the README troubleshooting section.")
-        st.stop()
-
-valid = all_data["RER"].dropna()
-if valid.empty:
-    st.warning("No overlapping, valid CPI and FX observations were found for this pair. Try another pair. IMF coverage varies by country and period.")
-    with st.expander("IMF series availability"):
-        st.dataframe(all_data.notna().sum().rename("Nonmissing months"))
-    st.stop()
-
-available_start, available_end = valid.index.min().to_period("M"), valid.index.max().to_period("M")
-st.caption(f"Overlapping RER coverage: **{available_start}** to **{available_end}** ({len(valid):,} valid months)")
-min_month = FIRST_MONTH
-max_month = pd.Period(date.today(), freq="M")
-months = pd.period_range(min_month, max_month, freq="M")
-month_options = [str(m) for m in months]
-a, b, c = st.columns([1, 1, 1])
-with a:
-    start_str = st.selectbox("Start month", month_options, index=months.get_loc(available_start))
-with b:
-    end_str = st.selectbox("End month", month_options, index=months.get_loc(available_end))
-with c:
-    view = st.radio("Show series", ["Both", "Real", "Nominal"], horizontal=True)
-start, end = pd.Period(start_str, freq="M"), pd.Period(end_str, freq="M")
 if start > end:
     st.error("Start month must not be later than end month.")
     st.stop()
+if end > pd.Period(date.today(), freq="M"):
+    st.error("End month cannot be in the future.")
+    st.stop()
+
+with st.spinner("Retrieving IMF monthly observations..."):
+    try:
+        all_data = calculate(country1, country2)
+    except Exception as exc:
+        st.error(f"Unable to retrieve or parse IMF data: {exc}")
+        st.stop()
 
 sample = all_data.loc[start.to_timestamp():end.to_timestamp()].copy()
-mean_rer = sample["RER"].mean(skipna=True)
-if pd.isna(mean_rer) or mean_rer <= 0:
-    st.warning("No valid real exchange-rate observations in the selected period. Adjust the dates.")
+valid = sample["RER"].dropna()
+with st.expander("Data availability and diagnostics", expanded=valid.empty):
+    cols = ["P1_CPI", "P2_CPI", "FX1_local_per_USD", "FX2_local_per_USD", "RER"]
+    diagnostics = []
+    for col in cols:
+        series = all_data[col].dropna()
+        diagnostics.append({"Series": col, "All valid months": len(series),
+                            "First available": series.index.min().strftime("%Y-%m") if len(series) else "—",
+                            "Last available": series.index.max().strftime("%Y-%m") if len(series) else "—",
+                            "Valid in selected period": int(sample[col].notna().sum())})
+    st.dataframe(pd.DataFrame(diagnostics), hide_index=True, use_container_width=True)
+    st.caption("Missing observations are never interpolated or fabricated. USD/USD is defined as 1.")
+
+if valid.empty:
+    st.warning("No overlapping valid CPI and exchange-rate observations in the selected period. See diagnostics above; choose a period with overlapping coverage.")
     st.stop()
-sample["RER_star_sample_mean"] = mean_rer
-sample["Real_Index"] = 100 * sample["RER"] / mean_rer
-sample["Valid_RER"] = sample["RER"].notna()
+benchmark = valid.mean()
+sample["RER_star"] = benchmark
+sample["Real_Index"] = 100 * sample["RER"] / benchmark
+sample["Country_1"] = country1
+sample["Country_2"] = country2
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Sample mean RER (RER*)", f"{mean_rer:,.4f}")
-m2.metric("Valid months", f"{sample['Valid_RER'].sum():,} / {len(sample):,}")
+m1.metric("Benchmark RER*", f"{benchmark:,.5f}")
+m2.metric("Valid months", f"{len(valid)} / {len(sample)}")
 m3.metric("Mean Real Index", f"{sample['Real_Index'].mean():.2f}")
-st.caption(f"Nominal S: units of **{country2} currency** per **1 unit of {country1} currency**. "
-           "Real Index = 100 at the selected sample's mean RER.")
+st.caption(f"Nominal exchange rate: units of {country2} currency per 1 unit of {country1} currency. Real Index: sample mean = 100.")
 
-chart_data = sample.reset_index()
-base = alt.Chart(chart_data).encode(x=alt.X("Month:T", title="Month"))
-real_line = base.mark_line(color="#1677b8", strokeWidth=2).encode(
-    y=alt.Y("Real_Index:Q", title="Real Index (sample mean = 100)", scale=alt.Scale(zero=False)),
-    tooltip=[alt.Tooltip("Month:T", format="%Y-%m"), alt.Tooltip("Real_Index:Q", format=".2f")])
-nominal_line = base.mark_line(color="#e58b2a", strokeWidth=2).encode(
-    y=alt.Y("S_currency2_per_currency1:Q", title=f"Nominal S ({country2}/{country1})", scale=alt.Scale(zero=False)),
-    tooltip=[alt.Tooltip("Month:T", format="%Y-%m"), alt.Tooltip("S_currency2_per_currency1:Q", format=".5f")])
-if view == "Both":
-    chart = alt.layer(real_line, nominal_line).resolve_scale(y="independent")
-elif view == "Real":
-    chart = real_line
-else:
-    chart = nominal_line
-st.altair_chart(chart.properties(height=450).interactive(), use_container_width=True)
+fig = make_subplots(specs=[[{"secondary_y": True}]])
+if view in ("Real", "Both"):
+    fig.add_trace(go.Scatter(x=sample.index, y=sample["Real_Index"], name="Real Exchange Rate Index",
+                             mode="lines", line=dict(color="#1876b9", width=2.7),
+                             hovertemplate="%{x|%Y-%m}<br>Real Index: %{y:.2f}<extra></extra>"), secondary_y=False)
+    fig.add_hline(y=100, line_dash="dash", line_color="#8794a5", opacity=0.8,
+                  annotation_text="Benchmark = 100", annotation_position="top left")
+if view in ("Nominal", "Both"):
+    fig.add_trace(go.Scatter(x=sample.index, y=sample["S_currency2_per_currency1"], name="Nominal Exchange Rate",
+                             mode="lines", line=dict(color="#ed9140", width=2.7),
+                             hovertemplate="%{x|%Y-%m}<br>Nominal: %{y:.5f}<extra></extra>"), secondary_y=True)
+fig.update_yaxes(title_text="Real Exchange Rate Index (mean = 100)", secondary_y=False,
+                 visible=view != "Nominal", showgrid=view != "Nominal")
+fig.update_yaxes(title_text=f"Nominal ({country2} per {country1})", secondary_y=True,
+                 visible=view != "Real", showgrid=False)
+fig.update_layout(title=f"{country1} / {country2} · {start} to {end}", height=510,
+                  hovermode="x unified", legend=dict(orientation="h", y=1.1),
+                  margin=dict(l=40, r=40, t=100, b=30), template="plotly_white")
+st.plotly_chart(fig, use_container_width=True)
+st.info("An increase in the Real Index indicates real depreciation of Country 1 relative to Country 2; a decrease indicates real appreciation. The index is relative to the selected-period average, not an absolute PPP valuation.")
 
 st.subheader("Monthly observations and calculations")
-st.dataframe(sample.reset_index(), use_container_width=True, hide_index=True)
-st.download_button("⬇️ Download selected sample (CSV)", data=sample.reset_index().to_csv(index=False).encode("utf-8"),
-                   file_name=f"imf_rer_{country1}_{country2}_{start}_{end}.csv", mime="text/csv")
-with st.expander("Methodology and missing data"):
-    st.markdown("""
-- **Source:** IMF SDMX 3.0, IMF.STA CPI and ER dataflows. CPI key: `{ISO3}.CPI._T.IX.M`; FX key: `{ISO3}.XDC_USD.PA_RT.M`.
-- **FX direction:** IMF FX is local currency per USD; `S = FX2 / FX1`. USD/USD is fixed at 1.
-- **Real exchange rate:** `RER = S × CPI1 / CPI2`.
-- **Benchmark:** `RER*` is the arithmetic mean over **valid overlapping months in the selected window**. The Real Index is `100 × RER / RER*`.
-- **Missing observations:** No interpolation, forward fill, or fabricated historical data. Rows with missing components remain in the CSV, with blank derived values.
-- **Interpretation:** CPI index reference bases can differ across countries; this is a relative index around a selected-period mean, not a claim about absolute purchasing-power parity.
-- **Euro area:** `G163` is queried as supplied by IMF; historical Euro area CPI/FX coverage may be limited and should not be assumed to exist before the euro.
-- **Country selector:** ISO country/territory names are listed for convenience; not every code is an IMF reporting economy or has both required series.
-""")
+export = sample.reset_index().rename(columns={"Month":"Date", "P1_CPI":"CPI_Country_1", "P2_CPI":"CPI_Country_2",
+     "FX1_local_per_USD":"FX1_local_per_USD", "FX2_local_per_USD":"FX2_local_per_USD",
+     "S_currency2_per_currency1":"Nominal_S", "RER_star":"Benchmark_RER_star", "Real_Index":"Real_Exchange_Rate_Index"})
+export = export[["Date", "Country_1", "Country_2", "CPI_Country_1", "CPI_Country_2",
+                 "FX1_local_per_USD", "FX2_local_per_USD", "Nominal_S", "RER", "Benchmark_RER_star", "Real_Exchange_Rate_Index"]]
+st.dataframe(export, hide_index=True, use_container_width=True)
+st.download_button("⬇ Download selected data (CSV)", export.to_csv(index=False).encode("utf-8-sig"),
+                   file_name=f"rer_{country1}_{country2}_{start}_{end}.csv", mime="text/csv")
+with st.expander("Methodology and interpretation"):
+    st.latex(r"S_t=\frac{FX_{2,t}}{FX_{1,t}},\qquad RER_t=S_t\frac{P_{1,t}}{P_{2,t}}")
+    st.latex(r"RER^*=\operatorname{mean}(RER_t),\qquad RealIndex_t=100\frac{RER_t}{RER^*}")
+    st.markdown("""IMF FX rates are local currency per US dollar; their ratio yields Country 2 currency per Country 1 currency. USA FX is fixed at 1. The benchmark is recalculated from valid months in the selected window. CPI series can have different base periods; the normalized index is a relative measure, not an absolute PPP valuation. Some IMF country/area series may have limited coverage.""")
