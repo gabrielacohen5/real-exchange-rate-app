@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 from datetime import date
 from xml.etree import ElementTree as ET
@@ -98,35 +99,95 @@ def parse_xml(payload: bytes) -> pd.Series:
     return frame.drop_duplicates("month").set_index("month")["value"].sort_index()
 
 
+def parse_sdmx_json(payload: bytes) -> pd.Series:
+    """Read SDMX-JSON observation arrays, including series-level observations."""
+    doc = json.loads(payload)
+    root = doc.get("data", doc)
+    datasets = root.get("dataSets", root.get("datasets", []))
+    structure = doc.get("structure", root.get("structure", {}))
+    dimensions = structure.get("dimensions", {})
+    obs_dims = dimensions.get("observation", [])
+    series_dims = dimensions.get("series", [])
+    all_dims = dimensions.get("dataSet", []) + series_dims + obs_dims
+
+    def time_from_key(key: str, dims: list[dict]) -> pd.Period | None:
+        indices = str(key).split(":")
+        for position, dimension in enumerate(dims):
+            if dimension.get("id", "").upper() in ("TIME_PERIOD", "TIME") and position < len(indices):
+                values = dimension.get("values", [])
+                try:
+                    item = values[int(indices[position])]
+                    return parse_month(item.get("id", item.get("name", "")) if isinstance(item, dict) else item)
+                except (ValueError, IndexError, TypeError):
+                    return None
+        return None
+
+    records = []
+
+    def collect(observations: dict, dims: list[dict]):
+        for key, observation in observations.items():
+            month = time_from_key(key, dims)
+            if isinstance(observation, dict):
+                month = month or parse_month(observation.get("TIME_PERIOD", observation.get("time", "")))
+                raw = observation.get("OBS_VALUE", observation.get("value"))
+            elif isinstance(observation, list):
+                raw = observation[0] if observation else None
+            else:
+                raw = observation
+            try:
+                value = float(raw)
+            except (ValueError, TypeError):
+                continue
+            if month is not None and pd.notna(value) and value > 0:
+                records.append((month, value))
+
+    for dataset in datasets:
+        collect(dataset.get("observations", {}), obs_dims or all_dims)
+        for series in dataset.get("series", {}).values():
+            collect(series.get("observations", {}), obs_dims or all_dims)
+    # Some SDMX-JSON implementations expose observations at the data root.
+    if not datasets:
+        collect(root.get("observations", {}), obs_dims or all_dims)
+    if not records:
+        return pd.Series(dtype="float64")
+    frame = pd.DataFrame(records, columns=["month", "value"])
+    conflicts = frame.groupby("month")["value"].nunique()
+    if (conflicts > 1).any():
+        raise IMFError("IMF JSON returned conflicting values for the same month.")
+    return frame.drop_duplicates("month").set_index("month")["value"].sort_index().astype(float)
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_series(iso3: str, indicator: str) -> pd.Series:
-    """Fetch one explicitly keyed monthly IMF series; never substitute other indicators."""
+    """Fetch monthly CPI or FX from its dedicated IMF SDMX 3.0 dataflow."""
+    if iso3 == "USA" and indicator == "XDC_USD.PA_RT":
+        # USD per USD is exactly 1; the IMF exchange-rate endpoint is unnecessary.
+        return pd.Series(1.0, index=pd.period_range(START, pd.Period(date.today(), freq="M"), freq="M"))
+
+    flow = "CPI" if indicator == "CPI._T.IX" else "ER"
     key = f"{iso3}.{indicator}.M"
-    # IMF external SDMX 3.0: dataflow ID and complete dimension key.
-    # Dataflow names differ across IMF migrations; try both the user-specified
-    # compact indicator dataflow and the legacy-compatible IFS dataflow.
-    endpoints = [
-        f"{BASE}/data/IMF.STA,IFS,1.0/{key}",
-        f"{BASE}/data/IMF.STA,IFS,1.1/{key}",
-    ]
-    errors = []
-    for endpoint in endpoints:
-        try:
-            response = requests.get(
-                endpoint,
-                params={"startPeriod": "1976-01", "format": "csvfile"},
-                headers={"Accept": "text/csv, application/vnd.sdmx.csv;version=2, application/vnd.sdmx.csv"},
-                timeout=TIMEOUT,
-            )
-            response.raise_for_status()
-            content = response.content
-            series = parse_xml(content) if content.lstrip().startswith(b"<") else parse_csv(content)
-            if not series.empty:
-                return series.loc[series.index >= START]
-            errors.append("No positive monthly observations")
-        except (requests.RequestException, ValueError, ET.ParseError, IMFError) as exc:
-            errors.append(str(exc)[:180])
-    raise IMFError(f"Could not retrieve {key}. IMF API responses: {' | '.join(errors)}")
+    endpoint = f"{BASE}/data/dataflow/IMF.STA/{flow}/+/{key}"
+    end = pd.Period(date.today(), freq="M")
+    try:
+        response = requests.get(
+            endpoint,
+            params={"c[TIME_PERIOD]": f"ge:{START}+le:{end}"},
+            headers={"Accept": "application/vnd.sdmx.data+json;version=2, application/json;q=0.9"},
+            timeout=TIMEOUT,
+        )
+        response.raise_for_status()
+        content = response.content
+        if content.lstrip().startswith((b"{", b"[")):
+            series = parse_sdmx_json(content)
+        elif content.lstrip().startswith(b"<"):
+            series = parse_xml(content)
+        else:
+            series = parse_csv(content)
+        if series.empty:
+            raise IMFError("No valid positive monthly observations were returned.")
+        return series.loc[(series.index >= START) & (series.index <= end)]
+    except (requests.RequestException, ValueError, ET.ParseError, IMFError, KeyError, TypeError) as exc:
+        raise IMFError(f"Could not retrieve {key} from {flow} dataflow: {exc}") from exc
 
 
 def compute(country1: str, country2: str) -> pd.DataFrame:
@@ -225,7 +286,7 @@ with st.expander("Data definitions and limitations"):
     st.markdown("""
 - **P1, P2:** IMF monthly CPI index levels. **XDC_per_USD_1/2:** domestic currency per US dollar.
 - **S = XDC_per_USD_2 / XDC_per_USD_1**, in Country 2 currency per unit of Country 1 currency.
-- **RER = S × P1 / P2**. **RER\*** is the arithmetic mean of valid RER values *within the selected sample*.
+- **RER = S × P1 / P2**. **RER*** is the arithmetic mean of valid RER values *within the selected sample*.
 - **Real_Index = 100 × RER / RER\***. Nominal S is not normalized.
 - Missing, zero, or invalid source values are not filled. The CSV includes missing months with blank calculations.
 - IMF series availability varies by economy and time; CPI base years can differ, so the real index is benchmarked to the chosen sample.
